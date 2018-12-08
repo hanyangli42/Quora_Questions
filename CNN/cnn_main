@@ -1,0 +1,194 @@
+import torch
+import torch.nn as nn
+from torch.nn import Sequential
+import torch.nn.functional as F
+from torchvision import transforms, datasets, models
+import numpy as np
+import matplotlib.pyplot as plt
+from torch.autograd import Variable
+from collections import namedtuple
+from IPython.display import Image
+from torch.utils.data import Dataset, DataLoader
+import os
+from sklearn.preprocessing import normalize
+from utils import EER
+from sklearn.metrics.pairwise import cosine_similarity
+
+import random
+from matplotlib import pyplot as plt
+import pandas as pd
+
+import time
+from tqdm import tqdm
+import csv
+
+
+
+def pad_data(data, length):
+	'''
+	pad all utterances to a specific length from the beginning of the original utterances.
+
+	data: (n,) containing n utterances
+	length: integer specifying the length of the padmed data
+	'''
+	n = len(data)
+	if n >= length:
+	  data_padmed = data[:length]
+	else:
+	  data_padmed = np.pad(data,((0,length - n),(0,0)), mode = 'wrap')
+	return data_padmed.astype(np.float32)
+
+	
+def combine_dataset(x1, x2, ind):
+	'''
+	Combine the enrollment array and the test array into one array. Adjust the utterance ids for the test array accordingly
+	'''
+
+	x_combined = np.hstack((x1, x2))
+	ind[:,1] = ind[:,1] + len(x1)
+	return x_combined, ind
+
+
+# create customized datasets
+class SpeechDataset(Dataset):
+	def __init__(self, X, y, pad_func, pad_len, train = True):
+		self.X = X
+		self.train = train
+		self.pad_func = pad_func
+		self.pad_len = pad_len
+
+		if y is None:
+			self.y = None
+		else:
+			self.y = torch.from_numpy(y)
+	
+	def __getitem__(self, ind):
+		data = self.pad_func(self.X[ind], self.pad_len)
+		data = torch.from_numpy(data)
+		data = data.view(1, data.shape[0], data.shape[1])
+		
+		if self.y is None:
+			# label = torch.tensor(0)
+			label = ind
+		else:
+			label = self.y[ind]
+		return data, label
+
+	def __len__(self):
+		return self.X.shape[0]
+
+
+
+
+# class Flatten(nn.Module):
+#   """
+#   A simple custom module that reshapes (n, m, 1, 1) tensors to (n, m).
+#   """
+#   def forward(self, x):
+
+#       # temp
+#       print (x.size())
+
+#       n,m,k,d = x.size()
+#       return  x.view(n,m)
+
+class Flatten(nn.Module):
+	"""
+	A simple custom module that reshapes (n, m, 1, 1) tensors to (n, m).
+	"""
+	def __init__(self):
+		super(Flatten,self).__init__()
+	def forward(self,x):
+		return torch.squeeze(x)
+
+
+
+# ResNet
+# citation: used ResNet open source code from https://github.com/pytorch/vision/blob/master/torchvision/models/resnet.py
+
+
+def conv3x3(in_planes, out_planes, stride=1):
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
+                     padding=1, bias=False)    
+    
+class BasicBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, inplanes, planes, stride=1):
+        super(BasicBlock, self).__init__()
+        self.conv1 = conv3x3(inplanes, planes, stride)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.elu = nn.ELU(inplace=True)
+        self.conv2 = conv3x3(planes, planes)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.stride = stride
+
+    def forward(self, x):
+        residual = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.elu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+        
+        out += residual
+        out = self.elu(out)
+
+        return out
+
+class SpeechNetwork(nn.Module):
+	def __init__(self): 
+		super(SpeechNetwork, self).__init__()        
+		self.embedding_network = Sequential(
+		  nn.Conv2d(1,32,kernel_size = 5,padding = 0,stride = 2,bias = False),
+		  nn.ELU(inplace=True),
+		  BasicBlock(32,32), 
+		  nn.Conv2d(32,64,kernel_size = 5,padding = 0,stride = 2,bias = False),
+		  nn.ELU(inplace=True),
+		  BasicBlock(64,64),  
+		  nn.Conv2d(64,128,kernel_size = 5,padding = 0,stride = 2,bias = False),
+		  nn.ELU(inplace=True),
+		  BasicBlock(128,128), 
+		  nn.Conv2d(128,256,kernel_size = 5,padding = 0,stride = 2,bias = False),
+		  nn.ELU(inplace=True),
+		  BasicBlock(256,256),
+		  Flatten()
+		)
+		self.final_layer = Sequential(
+			nn.Linear(256,3429,bias = False),
+			Flatten()
+		)
+
+
+	def get_embedding(self,x):
+		alpha=16
+		x_avgpool = self.embedding_network(x).mean(2) # average pooling
+		x_norm = F.normalize(x_avgpool, p=2, dim=1) # normalize 
+		return alpha * x_norm
+		
+	def forward(self, x):
+		final_classes = self.final_layer(self.get_embedding(x))
+		return final_classes
+
+def cos_similarity(embeddings,ind):
+	similarity = []
+	for i1,i2 in ind:
+		similarity.append(cosine_similarity([embeddings[i1,:]],[embeddings[i2,:]])[0][0])
+	return np.array(similarity)
+		
+		
+# def predict(model, test_loader,test_size,emb_size,test_indx,use_cuda):
+# 	representations = inference(model, test_loader,test_size,emb_size,use_cuda)
+# 	pred_test = cos_similarity(representations,test_indx)
+
+def init_weights(m):
+	if type(m) == nn.Linear:
+		nn.init.kaiming_normal_(m.weight)
+
+# learning rate auto tuner
+def tune_lr(optimizer, epoch_num):
+	lr = 0.001 * (0.1 ** (epoch_num // 3))
+	for param_group in optimizer.param_groups:
+		param_group['lr'] = lr
